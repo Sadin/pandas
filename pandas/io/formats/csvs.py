@@ -1,42 +1,80 @@
-# -*- coding: utf-8 -*-
 """
 Module for formatting output data into CSV files.
 """
 
-from __future__ import print_function
-
 import csv as csvlib
+from io import StringIO, TextIOWrapper
+import os
+from typing import Hashable, List, Optional, Sequence, Union
+import warnings
+
 import numpy as np
 
-from pandas.core.dtypes.missing import notna
-from pandas.core.dtypes.inference import is_file_like
-from pandas.core.index import Index, MultiIndex
-from pandas import compat
-from pandas.compat import (StringIO, range, zip)
-
-from pandas.io.common import (_get_handle, UnicodeWriter, _expand_user,
-                              _stringify_path)
 from pandas._libs import writers as libwriters
-from pandas.core.indexes.datetimes import DatetimeIndex
-from pandas.core.indexes.period import PeriodIndex
+from pandas._typing import CompressionOptions, FilePathOrBuffer, StorageOptions
+
+from pandas.core.dtypes.generic import (
+    ABCDatetimeIndex,
+    ABCIndexClass,
+    ABCMultiIndex,
+    ABCPeriodIndex,
+)
+from pandas.core.dtypes.missing import notna
+
+from pandas.io.common import (
+    get_compression_method,
+    get_filepath_or_buffer,
+    get_handle,
+    infer_compression,
+)
 
 
-class CSVFormatter(object):
-
-    def __init__(self, obj, path_or_buf=None, sep=",", na_rep='',
-                 float_format=None, cols=None, header=True, index=True,
-                 index_label=None, mode='w', nanRep=None, encoding=None,
-                 compression=None, quoting=None, line_terminator='\n',
-                 chunksize=None, tupleize_cols=False, quotechar='"',
-                 date_format=None, doublequote=True, escapechar=None,
-                 decimal='.'):
-
+class CSVFormatter:
+    def __init__(
+        self,
+        obj,
+        path_or_buf: Optional[FilePathOrBuffer[str]] = None,
+        sep: str = ",",
+        na_rep: str = "",
+        float_format: Optional[str] = None,
+        cols=None,
+        header: Union[bool, Sequence[Hashable]] = True,
+        index: bool = True,
+        index_label: Optional[Union[bool, Hashable, Sequence[Hashable]]] = None,
+        mode: str = "w",
+        encoding: Optional[str] = None,
+        errors: str = "strict",
+        compression: CompressionOptions = "infer",
+        quoting: Optional[int] = None,
+        line_terminator="\n",
+        chunksize: Optional[int] = None,
+        quotechar='"',
+        date_format: Optional[str] = None,
+        doublequote: bool = True,
+        escapechar: Optional[str] = None,
+        decimal=".",
+        storage_options: StorageOptions = None,
+    ):
         self.obj = obj
 
         if path_or_buf is None:
             path_or_buf = StringIO()
 
-        self.path_or_buf = _expand_user(_stringify_path(path_or_buf))
+        # Extract compression mode as given, if dict
+        compression, self.compression_args = get_compression_method(compression)
+        self.compression = infer_compression(path_or_buf, compression)
+
+        ioargs = get_filepath_or_buffer(
+            path_or_buf,
+            encoding=encoding,
+            compression=self.compression,
+            mode=mode,
+            storage_options=storage_options,
+        )
+        self.path_or_buf = ioargs.filepath_or_buffer
+        self.should_close = ioargs.should_close
+        self.mode = ioargs.mode
+
         self.sep = sep
         self.na_rep = na_rep
         self.float_format = float_format
@@ -45,9 +83,10 @@ class CSVFormatter(object):
         self.header = header
         self.index = index
         self.index_label = index_label
-        self.mode = mode
+        if encoding is None:
+            encoding = "utf-8"
         self.encoding = encoding
-        self.compression = compression
+        self.errors = errors
 
         if quoting is None:
             quoting = csvlib.QUOTE_MINIMAL
@@ -61,26 +100,25 @@ class CSVFormatter(object):
         self.doublequote = doublequote
         self.escapechar = escapechar
 
-        self.line_terminator = line_terminator
+        self.line_terminator = line_terminator or os.linesep
 
         self.date_format = date_format
 
-        self.tupleize_cols = tupleize_cols
-        self.has_mi_columns = (isinstance(obj.columns, MultiIndex) and
-                               not self.tupleize_cols)
+        self.has_mi_columns = isinstance(obj.columns, ABCMultiIndex)
 
         # validate mi options
         if self.has_mi_columns:
             if cols is not None:
-                raise TypeError("cannot specify cols with a MultiIndex on the "
-                                "columns")
+                raise TypeError("cannot specify cols with a MultiIndex on the columns")
 
         if cols is not None:
-            if isinstance(cols, Index):
-                cols = cols.to_native_types(na_rep=na_rep,
-                                            float_format=float_format,
-                                            date_format=date_format,
-                                            quoting=self.quoting)
+            if isinstance(cols, ABCIndexClass):
+                cols = cols.to_native_types(
+                    na_rep=na_rep,
+                    float_format=float_format,
+                    date_format=date_format,
+                    quoting=self.quoting,
+                )
             else:
                 cols = list(cols)
             self.obj = self.obj.loc[:, cols]
@@ -88,11 +126,13 @@ class CSVFormatter(object):
         # update columns to include possible multiplicity of dupes
         # and make sure sure cols is just a list of labels
         cols = self.obj.columns
-        if isinstance(cols, Index):
-            cols = cols.to_native_types(na_rep=na_rep,
-                                        float_format=float_format,
-                                        date_format=date_format,
-                                        quoting=self.quoting)
+        if isinstance(cols, ABCIndexClass):
+            cols = cols.to_native_types(
+                na_rep=na_rep,
+                float_format=float_format,
+                date_format=date_format,
+                quoting=self.quoting,
+            )
         else:
             cols = list(cols)
 
@@ -100,8 +140,7 @@ class CSVFormatter(object):
         self.cols = cols
 
         # preallocate data 2d list
-        self.blocks = self.obj._data.blocks
-        ncols = sum(b.shape[0] for b in self.blocks)
+        ncols = self.obj.shape[-1]
         self.data = [None] * ncols
 
         if chunksize is None:
@@ -109,83 +148,97 @@ class CSVFormatter(object):
         self.chunksize = int(chunksize)
 
         self.data_index = obj.index
-        if (isinstance(self.data_index, (DatetimeIndex, PeriodIndex)) and
-                date_format is not None):
-            self.data_index = Index([x.strftime(date_format) if notna(x) else
-                                     '' for x in self.data_index])
+        if (
+            isinstance(self.data_index, (ABCDatetimeIndex, ABCPeriodIndex))
+            and date_format is not None
+        ):
+            from pandas import Index
 
-        self.nlevels = getattr(self.data_index, 'nlevels', 1)
+            self.data_index = Index(
+                [x.strftime(date_format) if notna(x) else "" for x in self.data_index]
+            )
+
+        self.nlevels = getattr(self.data_index, "nlevels", 1)
         if not index:
             self.nlevels = 0
 
-    def save(self):
-        # create the writer & save
-        if self.encoding is None:
-            if compat.PY2:
-                encoding = 'ascii'
-            else:
-                encoding = 'utf-8'
-        else:
-            encoding = self.encoding
+    def save(self) -> None:
+        """
+        Create the writer & save.
+        """
+        # GH21227 internal compression is not used for non-binary handles.
+        if (
+            self.compression
+            and hasattr(self.path_or_buf, "write")
+            and "b" not in self.mode
+        ):
+            warnings.warn(
+                "compression has no effect when passing a non-binary object as input.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            self.compression = None
 
-        # PR 21300 uses string buffer to receive csv writing and dump into
-        # file-like output with compression as option. GH 21241, 21118
-        f = StringIO()
-        if not is_file_like(self.path_or_buf):
-            # path_or_buf is path
-            path_or_buf = self.path_or_buf
-        elif hasattr(self.path_or_buf, 'name'):
-            # path_or_buf is file handle
-            path_or_buf = self.path_or_buf.name
-        else:
-            # path_or_buf is file-like IO objects.
-            f = self.path_or_buf
-            path_or_buf = None
+        # get a handle or wrap an existing handle to take care of 1) compression and
+        # 2) text -> byte conversion
+        f, handles = get_handle(
+            self.path_or_buf,
+            self.mode,
+            encoding=self.encoding,
+            errors=self.errors,
+            compression=dict(self.compression_args, method=self.compression),
+        )
 
         try:
-            writer_kwargs = dict(lineterminator=self.line_terminator,
-                                 delimiter=self.sep, quoting=self.quoting,
-                                 doublequote=self.doublequote,
-                                 escapechar=self.escapechar,
-                                 quotechar=self.quotechar)
-            if encoding == 'ascii':
-                self.writer = csvlib.writer(f, **writer_kwargs)
-            else:
-                writer_kwargs['encoding'] = encoding
-                self.writer = UnicodeWriter(f, **writer_kwargs)
+            # Note: self.encoding is irrelevant here
+            self.writer = csvlib.writer(
+                f,
+                lineterminator=self.line_terminator,
+                delimiter=self.sep,
+                quoting=self.quoting,
+                doublequote=self.doublequote,
+                escapechar=self.escapechar,
+                quotechar=self.quotechar,
+            )
 
             self._save()
 
         finally:
-            # GH 17778 handles zip compression for byte strings separately.
-            buf = f.getvalue()
-            if path_or_buf:
-                f, handles = _get_handle(path_or_buf, self.mode,
-                                         encoding=encoding,
-                                         compression=self.compression)
-                f.write(buf)
+            if self.should_close:
                 f.close()
-                for _fh in handles:
-                    _fh.close()
+            elif (
+                isinstance(f, TextIOWrapper)
+                and not f.closed
+                and f != self.path_or_buf
+                and hasattr(self.path_or_buf, "write")
+            ):
+                # get_handle uses TextIOWrapper for non-binary handles. TextIOWrapper
+                # closes the wrapped handle if it is not detached.
+                f.flush()  # make sure everything is written
+                f.detach()  # makes f unusable
+                del f
+            elif f != self.path_or_buf:
+                f.close()
+            for _fh in handles:
+                _fh.close()
 
     def _save_header(self):
-
         writer = self.writer
         obj = self.obj
         index_label = self.index_label
         cols = self.cols
         has_mi_columns = self.has_mi_columns
         header = self.header
-        encoded_labels = []
+        encoded_labels: List[str] = []
 
-        has_aliases = isinstance(header, (tuple, list, np.ndarray, Index))
+        has_aliases = isinstance(header, (tuple, list, np.ndarray, ABCIndexClass))
         if not (has_aliases or self.header):
             return
         if has_aliases:
             if len(header) != len(cols):
-                raise ValueError(('Writing {ncols} cols but got {nalias} '
-                                 'aliases'.format(ncols=len(cols),
-                                                  nalias=len(header))))
+                raise ValueError(
+                    f"Writing {len(cols)} cols but got {len(header)} aliases"
+                )
             else:
                 write_cols = header
         else:
@@ -195,20 +248,21 @@ class CSVFormatter(object):
             # should write something for index label
             if index_label is not False:
                 if index_label is None:
-                    if isinstance(obj.index, MultiIndex):
+                    if isinstance(obj.index, ABCMultiIndex):
                         index_label = []
                         for i, name in enumerate(obj.index.names):
                             if name is None:
-                                name = ''
+                                name = ""
                             index_label.append(name)
                     else:
                         index_label = obj.index.name
                         if index_label is None:
-                            index_label = ['']
+                            index_label = [""]
                         else:
                             index_label = [index_label]
-                elif not isinstance(index_label,
-                                    (list, tuple, np.ndarray, Index)):
+                elif not isinstance(
+                    index_label, (list, tuple, np.ndarray, ABCIndexClass)
+                ):
                     # given a string for a DF with Index
                     index_label = [index_label]
 
@@ -235,7 +289,7 @@ class CSVFormatter(object):
                     col_line.append(columns.names[i])
 
                     if isinstance(index_label, list) and len(index_label) > 1:
-                        col_line.extend([''] * (len(index_label) - 1))
+                        col_line.extend([""] * (len(index_label) - 1))
 
                 col_line.extend(columns._get_level_values(i))
 
@@ -244,12 +298,11 @@ class CSVFormatter(object):
             # Write out the index line if it's not empty.
             # Otherwise, we will print out an extraneous
             # blank line between the mi and the data rows.
-            if encoded_labels and set(encoded_labels) != set(['']):
-                encoded_labels.extend([''] * len(columns))
+            if encoded_labels and set(encoded_labels) != {""}:
+                encoded_labels.extend([""] * len(columns))
                 writer.writerow(encoded_labels)
 
-    def _save(self):
-
+    def _save(self) -> None:
         self._save_header()
 
         nrows = len(self.data_index)
@@ -266,29 +319,36 @@ class CSVFormatter(object):
 
             self._save_chunk(start_i, end_i)
 
-    def _save_chunk(self, start_i, end_i):
-
+    def _save_chunk(self, start_i: int, end_i: int) -> None:
         data_index = self.data_index
 
         # create the data for a chunk
         slicer = slice(start_i, end_i)
-        for i in range(len(self.blocks)):
-            b = self.blocks[i]
-            d = b.to_native_types(slicer=slicer, na_rep=self.na_rep,
-                                  float_format=self.float_format,
-                                  decimal=self.decimal,
-                                  date_format=self.date_format,
-                                  quoting=self.quoting)
+
+        df = self.obj.iloc[slicer]
+        blocks = df._mgr.blocks
+
+        for i in range(len(blocks)):
+            b = blocks[i]
+            d = b.to_native_types(
+                na_rep=self.na_rep,
+                float_format=self.float_format,
+                decimal=self.decimal,
+                date_format=self.date_format,
+                quoting=self.quoting,
+            )
 
             for col_loc, col in zip(b.mgr_locs, d):
                 # self.data is a preallocated list
                 self.data[col_loc] = col
 
-        ix = data_index.to_native_types(slicer=slicer, na_rep=self.na_rep,
-                                        float_format=self.float_format,
-                                        decimal=self.decimal,
-                                        date_format=self.date_format,
-                                        quoting=self.quoting)
+        ix = data_index.to_native_types(
+            slicer=slicer,
+            na_rep=self.na_rep,
+            float_format=self.float_format,
+            decimal=self.decimal,
+            date_format=self.date_format,
+            quoting=self.quoting,
+        )
 
-        libwriters.write_csv_rows(self.data, ix, self.nlevels,
-                                  self.cols, self.writer)
+        libwriters.write_csv_rows(self.data, ix, self.nlevels, self.cols, self.writer)
